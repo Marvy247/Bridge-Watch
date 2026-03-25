@@ -77,6 +77,20 @@ pub struct DeviationThreshold {
     pub high_bps: i128,
 }
 
+/// Records a supply mismatch between Stellar and a source chain for a bridge.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupplyMismatch {
+    pub bridge_id: String,
+    pub asset_code: String,
+    pub stellar_supply: i128,
+    pub source_chain_supply: i128,
+    /// Mismatch expressed in basis points (1 bp = 0.01 %).
+    pub mismatch_bps: i128,
+    /// `true` when `mismatch_bps` is at or above the configured threshold.
+    pub is_critical: bool,
+    pub timestamp: u64,
+}
 /// Permission roles that can be assigned to admin addresses.
 ///
 /// - `SuperAdmin` – all permissions, can manage other roles.
@@ -110,6 +124,12 @@ pub enum DataKey {
     DeviationAlert(String),
     /// Admin-configured deviation thresholds for an asset.
     DeviationThreshold(String),
+    /// Historical supply mismatch records for a bridge (Vec<SupplyMismatch>).
+    SupplyMismatches(String),
+    /// Global critical mismatch threshold in basis points (default 10 bps / 0.1 %).
+    MismatchThreshold,
+    /// All bridge IDs that have at least one mismatch record (Vec<String>).
+    BridgeIds,
     /// Roles held by a specific address (Vec<AdminRole>).
     RoleKey(Address),
     /// Global list of all role assignments for enumeration.
@@ -360,6 +380,128 @@ impl BridgeWatchContract {
     }
 
     // -----------------------------------------------------------------------
+    // Bridge supply mismatch tracking (issue #28)
+    // -----------------------------------------------------------------------
+
+    /// Set the global critical mismatch threshold in basis points (admin only).
+    ///
+    /// Mismatches at or above this value are flagged as critical.
+    /// Default is 10 bps (0.1 %).
+    pub fn set_mismatch_threshold(env: Env, threshold_bps: i128) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MismatchThreshold, &threshold_bps);
+    }
+
+    /// Record a supply mismatch for a bridge asset (admin only).
+    ///
+    /// Calculates `mismatch_bps` as
+    /// `|stellar_supply - source_chain_supply| * 10_000 / source_chain_supply`
+    /// and sets `is_critical` when the value meets or exceeds the configured
+    /// threshold (default 10 bps / 0.1 %). Each call appends to the bridge's
+    /// historical record, enabling trend analysis over time.
+    pub fn record_supply_mismatch(
+        env: Env,
+        bridge_id: String,
+        asset_code: String,
+        stellar_supply: i128,
+        source_chain_supply: i128,
+    ) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let mismatch_bps = if source_chain_supply > 0 {
+            let diff = if stellar_supply > source_chain_supply {
+                stellar_supply - source_chain_supply
+            } else {
+                source_chain_supply - stellar_supply
+            };
+            diff * 10_000 / source_chain_supply
+        } else {
+            0
+        };
+
+        let threshold_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MismatchThreshold)
+            .unwrap_or(10);
+
+        let is_critical = mismatch_bps >= threshold_bps;
+
+        let record = SupplyMismatch {
+            bridge_id: bridge_id.clone(),
+            asset_code,
+            stellar_supply,
+            source_chain_supply,
+            mismatch_bps,
+            is_critical,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        let mut mismatches: Vec<SupplyMismatch> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupplyMismatches(bridge_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        mismatches.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupplyMismatches(bridge_id.clone()), &mismatches);
+
+        // Track bridge ID for cross-bridge queries
+        let mut bridge_ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeIds)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for b in bridge_ids.iter() {
+            if b == bridge_id {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bridge_ids.push_back(bridge_id);
+            env.storage()
+                .instance()
+                .set(&DataKey::BridgeIds, &bridge_ids);
+        }
+    }
+
+    /// Return all recorded supply mismatches for a bridge. Public read access.
+    pub fn get_supply_mismatches(env: Env, bridge_id: String) -> Vec<SupplyMismatch> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupplyMismatches(bridge_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return all critical mismatches across every tracked bridge. Public read access.
+    pub fn get_critical_mismatches(env: Env) -> Vec<SupplyMismatch> {
+        let bridge_ids: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeIds)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut critical: Vec<SupplyMismatch> = Vec::new(&env);
+        for bridge_id in bridge_ids.iter() {
+            let mismatches: Vec<SupplyMismatch> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SupplyMismatches(bridge_id.clone()))
+                .unwrap_or_else(|| Vec::new(&env));
+            for m in mismatches.iter() {
+                if m.is_critical {
+                    critical.push_back(m);
+                }
+            }
+        }
+        critical
     // Multi-admin role management (issue #25)
     // -----------------------------------------------------------------------
 
@@ -723,6 +865,116 @@ mod tests {
         let result = client.check_price_deviation(&asset, &1_010_000);
         assert!(result.is_some());
         assert_eq!(result.unwrap().severity, DeviationSeverity::Low);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge supply mismatch tracking tests (issue #28)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_record_supply_mismatch_not_critical() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let asset = String::from_str(&env, "USDC");
+
+        // diff=1_000, bps = 1_000*10_000/1_001_000 = 9 → below default threshold of 10
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_001_000);
+
+        let mismatches = client.get_supply_mismatches(&bridge);
+        assert_eq!(mismatches.len(), 1);
+        let m = mismatches.get(0).unwrap();
+        assert_eq!(m.mismatch_bps, 9);
+        assert!(!m.is_critical);
+    }
+
+    #[test]
+    fn test_record_supply_mismatch_critical() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let asset = String::from_str(&env, "USDC");
+
+        // diff=2_000, bps = 2_000*10_000/1_002_000 = 19 → above default threshold of 10
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_002_000);
+
+        let mismatches = client.get_supply_mismatches(&bridge);
+        let m = mismatches.get(0).unwrap();
+        assert_eq!(m.mismatch_bps, 19);
+        assert!(m.is_critical);
+    }
+
+    #[test]
+    fn test_set_mismatch_threshold_custom() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let asset = String::from_str(&env, "USDC");
+
+        // Tighten threshold to 5 bps; 9 bps mismatch should now be critical
+        client.set_mismatch_threshold(&5);
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &1_001_000);
+
+        let m = client.get_supply_mismatches(&bridge).get(0).unwrap();
+        assert!(m.is_critical);
+    }
+
+    #[test]
+    fn test_get_critical_mismatches_across_bridges() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let bridge1 = String::from_str(&env, "CIRCLE_USDC");
+        let bridge2 = String::from_str(&env, "WORMHOLE_EURC");
+        let asset = String::from_str(&env, "USDC");
+
+        // bridge1: 9 bps (not critical)
+        client.record_supply_mismatch(&bridge1, &asset, &1_000_000, &1_001_000);
+        // bridge2: 19 bps (critical)
+        client.record_supply_mismatch(&bridge2, &asset, &1_000_000, &1_002_000);
+
+        let critical = client.get_critical_mismatches();
+        assert_eq!(critical.len(), 1);
+        assert_eq!(critical.get(0).unwrap().bridge_id, bridge2);
+    }
+
+    #[test]
+    fn test_supply_mismatch_historical_tracking() {
+        let (env, client, _admin) = setup();
+
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let asset = String::from_str(&env, "USDC");
+
+        for i in 0..3u64 {
+            env.ledger().set_timestamp(1_000_000 + i * 3_600);
+            client.record_supply_mismatch(
+                &bridge,
+                &asset,
+                &(1_000_000 + i as i128 * 500),
+                &1_000_000,
+            );
+        }
+
+        let mismatches = client.get_supply_mismatches(&bridge);
+        assert_eq!(mismatches.len(), 3);
+    }
+
+    #[test]
+    fn test_zero_source_supply_returns_zero_bps() {
+        let (env, client, _admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+
+        let bridge = String::from_str(&env, "CIRCLE_USDC");
+        let asset = String::from_str(&env, "USDC");
+
+        client.record_supply_mismatch(&bridge, &asset, &1_000_000, &0);
+
+        let m = client.get_supply_mismatches(&bridge).get(0).unwrap();
+        assert_eq!(m.mismatch_bps, 0);
+        assert!(!m.is_critical);
     }
 
     // -----------------------------------------------------------------------
