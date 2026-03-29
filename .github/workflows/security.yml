@@ -105,22 +105,28 @@ jobs:
           generateSarif: true
         continue-on-error: true
 
-      - name: Check if SARIF file exists
+      - name: Check SARIF file
         id: check_sarif
         run: |
           if [ -f semgrep.sarif ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            # Check if SARIF has actual results
+            if grep -q '"results":\s*\[\s*\]' semgrep.sarif || ! grep -q '"results"' semgrep.sarif; then
+              echo "has_results=false" >> $GITHUB_OUTPUT
+              echo "SARIF file exists but has no results"
+            else
+              echo "has_results=true" >> $GITHUB_OUTPUT
+              echo "SARIF file has results"
+            fi
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "No SARIF file generated, creating empty one"
-            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[]}' > semgrep.sarif
+            echo "has_results=false" >> $GITHUB_OUTPUT
+            echo "No SARIF file generated"
           fi
 
       - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
-        if: always()
+        if: steps.check_sarif.outputs.has_results == 'true'
 
   codeql:
     name: CodeQL Analysis
@@ -196,22 +202,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
 
-      - name: Check if SARIF file exists
+      - name: Check SARIF file
         id: check_sarif
         run: |
           if [ -f gitleaks.sarif ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            # Check if SARIF has actual results
+            if grep -q '"results":\s*\[\s*\]' gitleaks.sarif || ! grep -q '"results"' gitleaks.sarif; then
+              echo "has_results=false" >> $GITHUB_OUTPUT
+              echo "SARIF file exists but has no results"
+            else
+              echo "has_results=true" >> $GITHUB_OUTPUT
+              echo "SARIF file has results"
+            fi
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "No SARIF file generated, creating empty one"
-            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[]}' > gitleaks.sarif
+            echo "has_results=false" >> $GITHUB_OUTPUT
+            echo "No SARIF file generated"
           fi
 
       - name: Upload gitleaks SARIF
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: gitleaks.sarif
-        if: always()
+        if: steps.check_sarif.outputs.has_results == 'true'
 
       - name: Upload gitleaks artifact
         uses: actions/upload-artifact@v4
